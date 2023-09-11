@@ -16,14 +16,17 @@ type TransferDB struct {
 	suffix string
 	db     *sql.DB
 	rdb    *sql.DB
+
+	withConflict bool
 }
 
 // NewTransferDB creates a new DB
-func NewTransferDB(db, rdb *sql.DB, name string) (*TransferDB, error) {
+func NewTransferDB(db, rdb *sql.DB, name string, withConflict bool) (*TransferDB, error) {
 	txdb := &TransferDB{
-		suffix: name,
-		db:     db,
-		rdb:    rdb,
+		suffix:       name,
+		db:           db,
+		rdb:          rdb,
+		withConflict: withConflict,
 	}
 
 	return txdb, nil
@@ -112,13 +115,13 @@ func (db *TransferDB) CreateTransferTableIndexes() error {
 	return nil
 }
 
-// AddTransfer adds a transfer to the db
-func (db *TransferDB) AddTransfer(tx *indexer.Transfer) error {
-
-	// insert transfer on conflict update
-	_, err := db.db.Exec(fmt.Sprintf(`
+func (db *TransferDB) makeTransferInsertSql() string {
+	sql := fmt.Sprintf(`
 	INSERT INTO t_transfers_%s (hash, tx_hash, token_id, created_at, from_to_addr, from_addr, to_addr, nonce, value, data, status)
 	VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+	`, db.suffix)
+	if db.withConflict {
+		sql += `
 	ON CONFLICT(hash) DO UPDATE SET
 		tx_hash = excluded.tx_hash,
 		token_id = excluded.token_id,
@@ -130,7 +133,17 @@ func (db *TransferDB) AddTransfer(tx *indexer.Transfer) error {
 		value = excluded.value,
 		data = excluded.data,
 		status = excluded.status
-	`, db.suffix), tx.Hash, tx.TxHash, tx.TokenID, tx.CreatedAt, tx.CombineFromTo(), tx.From, tx.To, tx.Nonce, tx.Value.String(), tx.Data, tx.Status)
+		`
+	}
+	return sql
+}
+
+// AddTransfer adds a transfer to the db
+func (db *TransferDB) AddTransfer(tx *indexer.Transfer) error {
+
+	sql := db.makeTransferInsertSql()
+	// insert transfer on conflict update
+	_, err := db.db.Exec(sql, tx.Hash, tx.TxHash, tx.TokenID, tx.CreatedAt, tx.CombineFromTo(), tx.From, tx.To, tx.Nonce, tx.Value.String(), tx.Data, tx.Status)
 
 	return err
 }
@@ -143,23 +156,11 @@ func (db *TransferDB) AddTransfers(tx []*indexer.Transfer) error {
 		return err
 	}
 
+	tSql := db.makeTransferInsertSql()
+
 	for _, t := range tx {
 		// insert transfer on conflict update
-		_, err := dbtx.Exec(fmt.Sprintf(`
-			INSERT INTO t_transfers_%s (hash, tx_hash, token_id, created_at, from_to_addr, from_addr, to_addr, nonce, value, data, status)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-			ON CONFLICT(hash) DO UPDATE SET
-				tx_hash = excluded.tx_hash,
-				token_id = excluded.token_id,
-				created_at = excluded.created_at,
-				from_to_addr = excluded.from_to_addr,
-				from_addr = excluded.from_addr,
-				to_addr = excluded.to_addr,
-				nonce = excluded.nonce,
-				value = excluded.value,
-				data = excluded.data,
-				status = excluded.status
-			`, db.suffix), t.Hash, t.TxHash, t.TokenID, t.CreatedAt, t.CombineFromTo(), t.From, t.To, t.Nonce, t.Value.String(), t.Data, t.Status)
+		_, err := dbtx.Exec(tSql, t.Hash, t.TxHash, t.TokenID, t.CreatedAt, t.CombineFromTo(), t.From, t.To, t.Nonce, t.Value.String(), t.Data, t.Status)
 		if err != nil {
 			return dbtx.Rollback()
 		}

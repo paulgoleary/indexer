@@ -20,12 +20,14 @@ type DB struct {
 
 	EventDB    *EventDB
 	TransferDB map[string]*TransferDB
+
+	fExists func(db *sql.DB, tableName string) (bool, error)
+
+	withConflict bool
 }
 
-// NewDB instantiates a new DB
-func NewDB(chainID *big.Int, username, password, name, host, rhost string) (*DB, error) {
-	connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=5432 sslmode=disable", username, password, name, host)
-	db, err := sql.Open("postgres", connStr)
+func newDBInternal(chainID *big.Int, host, rhost string, withConflict bool, fOpen func(string) (*sql.DB, error), fExists func(db *sql.DB, tableName string) (bool, error)) (*DB, error) {
+	db, err := fOpen(host)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -35,8 +37,7 @@ func NewDB(chainID *big.Int, username, password, name, host, rhost string) (*DB,
 		return nil, fmt.Errorf("failed to ping database: %w", err)
 	}
 
-	rconnStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=5432 sslmode=disable", username, password, name, rhost)
-	rdb, err := sql.Open("postgres", rconnStr)
+	rdb, err := fOpen(rhost)
 	if err != nil {
 		return nil, fmt.Errorf("failed to connect to database: %w", err)
 	}
@@ -48,16 +49,18 @@ func NewDB(chainID *big.Int, username, password, name, host, rhost string) (*DB,
 
 	evname := chainID.String()
 
-	eventDB, err := NewEventDB(db, rdb, evname)
+	eventDB, err := NewEventDB(db, rdb, evname, withConflict)
 	if err != nil {
 		return nil, err
 	}
 
 	d := &DB{
-		chainID: chainID,
-		db:      db,
-		rdb:     rdb,
-		EventDB: eventDB,
+		chainID:      chainID,
+		db:           db,
+		rdb:          rdb,
+		EventDB:      eventDB,
+		fExists:      fExists,
+		withConflict: withConflict,
 	}
 
 	// check if db exists before opening, since we use rwc mode
@@ -91,7 +94,7 @@ func NewDB(chainID *big.Int, username, password, name, host, rhost string) (*DB,
 		name := d.TransferName(ev.Contract)
 		log.Default().Println("creating transfer db for: ", name)
 
-		txdb[name], err = NewTransferDB(db, rdb, name)
+		txdb[name], err = NewTransferDB(db, rdb, name, withConflict)
 		if err != nil {
 			return nil, err
 		}
@@ -122,40 +125,41 @@ func NewDB(chainID *big.Int, username, password, name, host, rhost string) (*DB,
 	return d, nil
 }
 
-// EventTableExists checks if a table exists in the database
-func (db *DB) EventTableExists(suffix string) (bool, error) {
-	var exists bool
-	err := db.db.QueryRow(fmt.Sprintf(`
-    SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        AND table_name = 't_events_%s'
-    );
-    `, suffix)).Scan(&exists)
-	if err != nil {
-		return false, err
+// NewDB instantiates a new DB
+func NewDB(chainID *big.Int, username, password, name, hostIn, rhostIn string) (*DB, error) {
+
+	fExists := func(db *sql.DB, tableName string) (bool, error) {
+		var exists bool
+		err := db.QueryRow(fmt.Sprintf(`
+		   SELECT EXISTS (
+		       SELECT 1
+		       FROM information_schema.tables
+		       WHERE table_schema = 'public'
+		       AND table_name = '%s'
+		   );
+		   `, tableName)).Scan(&exists)
+		if err != nil {
+			return false, err
+		}
+		return exists, nil
 	}
 
-	return exists, nil
+	fOpen := func(host string) (*sql.DB, error) {
+		connStr := fmt.Sprintf("user=%s password=%s dbname=%s host=%s port=5432 sslmode=disable", username, password, name, host)
+		return sql.Open("postgres", connStr)
+	}
+
+	return newDBInternal(chainID, hostIn, rhostIn, true, fOpen, fExists)
+}
+
+// EventTableExists checks if a table exists in the database
+func (db *DB) EventTableExists(suffix string) (bool, error) {
+	return db.fExists(db.db, fmt.Sprintf("t_events_%s", suffix))
 }
 
 // TransferTableExists checks if a table exists in the database
 func (db *DB) TransferTableExists(suffix string) (bool, error) {
-	var exists bool
-	err := db.db.QueryRow(fmt.Sprintf(`
-    SELECT EXISTS (
-        SELECT 1
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        AND table_name = 't_transfers_%s'
-    );
-    `, suffix)).Scan(&exists)
-	if err != nil {
-		return false, err
-	}
-
-	return exists, nil
+	return db.fExists(db.db, fmt.Sprintf("t_transfers_%s", suffix))
 }
 
 // TransferName returns the name of the transfer db for the given contract
@@ -183,7 +187,7 @@ func (d *DB) AddTransferDB(contract string) (*TransferDB, error) {
 	if txdb, ok := d.TransferDB[name]; ok {
 		return txdb, nil
 	}
-	txdb, err := NewTransferDB(d.db, d.rdb, name)
+	txdb, err := NewTransferDB(d.db, d.rdb, name, d.withConflict)
 	if err != nil {
 		return nil, err
 	}

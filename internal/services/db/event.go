@@ -3,6 +3,7 @@ package db
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/citizenwallet/indexer/pkg/indexer"
@@ -12,14 +13,17 @@ type EventDB struct {
 	suffix string
 	db     *sql.DB
 	rdb    *sql.DB
+
+	withConflict bool
 }
 
 // NewTransferDB creates a new DB
-func NewEventDB(db, rdb *sql.DB, name string) (*EventDB, error) {
+func NewEventDB(db, rdb *sql.DB, name string, withConflict bool) (*EventDB, error) {
 	evdb := &EventDB{
-		suffix: name,
-		db:     db,
-		rdb:    rdb,
+		suffix:       name,
+		db:           db,
+		rdb:          rdb,
+		withConflict: withConflict,
 	}
 
 	return evdb, nil
@@ -46,10 +50,16 @@ func (db *EventDB) CreateEventsTable(suffix string) error {
 		last_block integer NOT NULL,
 		standard text NOT NULL,
 		name text NOT NULL,
-		symbol text NOT NULL,
-		UNIQUE (contract, standard)
+		symbol text NOT NULL
 	);
 	`, suffix))
+	if err != nil {
+		return err
+	}
+
+	_, err = db.db.Exec(fmt.Sprintf(`
+	CREATE UNIQUE INDEX IF NOT EXISTS uidx_events_%s ON t_events_%s(contract, standard)
+	`, suffix, suffix))
 
 	return err
 }
@@ -201,9 +211,12 @@ func (db *EventDB) SetEventLastBlock(contract string, standard indexer.Standard,
 func (db *EventDB) AddEvent(contract string, state indexer.EventState, startBlk, lastBlk int64, std indexer.Standard, name, symbol string) error {
 	t := time.Now()
 
-	_, err := db.db.Exec(fmt.Sprintf(`
+	sql := fmt.Sprintf(`
     INSERT INTO t_events_%s (contract, state, created_at, updated_at, start_block, last_block, standard, name, symbol)
-    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`, db.suffix)
+
+	if db.withConflict {
+		sql += `
     ON CONFLICT(contract, standard) DO UPDATE SET
         state = excluded.state,
         updated_at = excluded.updated_at,
@@ -211,7 +224,10 @@ func (db *EventDB) AddEvent(contract string, state indexer.EventState, startBlk,
         last_block = excluded.last_block,
         name = excluded.name,
         symbol = excluded.symbol
-    `, db.suffix), contract, state, t, t, startBlk, lastBlk, std, name, symbol)
+		`
+	}
+
+	_, err := db.db.Exec(sql, contract, state, t, t, strconv.Itoa(int(startBlk)), strconv.Itoa(int(lastBlk)), std, name, symbol)
 
 	return err
 }
